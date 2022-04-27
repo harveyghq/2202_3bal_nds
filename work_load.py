@@ -18,6 +18,8 @@ from ryu.topology.api import get_switch, get_link
 from ryu.lib.packet import ether_types
 from collections import defaultdict
 from ryu.topology.api import get_host, get_link, get_switch
+from threading import Semaphore
+import time
 
 ETHERNET = ethernet.ethernet.__name__
 ETHERNET_MULTICAST = "ff:ff:ff:ff:ff:ff"
@@ -31,6 +33,7 @@ class Workload(app_manager.RyuApp):
     
         self.COUNT_WORKLOAD_INTERVAL = 4
         self.PRINT_WORKLOAD_INTERVAL = 5
+        self.LINK_MAX_BANDWIDTH = 1000
 
         self.topology_api_app = self
         self.datapaths = {} # dpid: datapath
@@ -40,7 +43,7 @@ class Workload(app_manager.RyuApp):
         self.port_info = {}  # dpid: (ports linked hosts)
         self.topo_map = nx.Graph()
         self.workload_thread = hub.spawn(self._count_workload)
-        self.print_workload_thread = hub.spawn(self.print_port_stats)
+        # self.print_workload_thread = hub.spawn(self.print_port_stats)
         self.mac_to_port = {}
         self.mac_ip_inport = {}
         self.sw = {} # use it to avoid arp loop
@@ -49,6 +52,10 @@ class Workload(app_manager.RyuApp):
         # you need to store workload of every port here
         self.last_port_stats = {} # (dpid, port_no): {bytes: total_bytes, time: total_time}
         self.workload = {} # dpid: {port_no : work_load}
+
+        self.get_bottom_link_lock = Semaphore()
+        self.links_info_tmp = {} # all avail paths with bottom link info
+        self.last_handle_ipv4 = {} # (srcip, dstip): timestamp
 
 
     def _count_workload(self):
@@ -262,31 +269,47 @@ class Workload(app_manager.RyuApp):
             # self.logger.info('%s: packet: %s to %s from port %s to port ? (flooded)', dpid, src, dst, in_port)
 
 
-    #just your code in exp1 mission2
-
 ############################get shortest(hop) path############################
     def handle_ipv4(self, msg, src_ip, dst_ip, pkt_type):
         parser = msg.datapath.ofproto_parser
 
-        dpid_path = self.shortest_path(src_ip, dst_ip,weight=self.weight)
-        if not dpid_path:
+        self.get_bottom_link_lock.acquire()
+        now = time.time()
+        if (src_ip, dst_ip) in self.last_handle_ipv4 and now - self.last_handle_ipv4[(src_ip, dst_ip)] < 2.0:
+            self.get_bottom_link_lock.release()
+            return # don't calc same route multiple times
+
+        all_path = self.available_path(src_ip, dst_ip)
+        if not all_path:
+            self.get_bottom_link_lock.release()
             return
 
-        self.path=dpid_path
+        self.links_info_tmp = {}
+        # sort all paths according to bw of bottom link
+        all_path = sorted(all_path, self.path_cmp)
+        dpid_path = all_path[0]
+        self.logger.info('%s path(s) in total:' % len(all_path))
+        for path in all_path:
+            self.show_path_with_bottom_link(src_ip, dst_ip, path, self.links_info_tmp[str(path)])
+        self.logger.info('selected:')
+
         # get port path:  h1 -> in_port, s1, out_port -> h2
         port_path = []
         for i in range(1, len(dpid_path) - 1):
             in_port = self.link_info[(dpid_path[i], dpid_path[i - 1])]
             out_port = self.link_info[(dpid_path[i], dpid_path[i + 1])]
             port_path.append((in_port, dpid_path[i], out_port))
-        # self.show_path(src_ip, dst_ip, port_path)
-
+        self.show_path(src_ip, dst_ip, port_path)
+        self.logger.info('')
 
         # send flow mod
         for node in port_path:
             in_port, dpid, out_port = node
-            self.send_flow_mod(parser, dpid, pkt_type, src_ip, dst_ip, in_port, out_port)
-            self.send_flow_mod(parser, dpid, pkt_type, dst_ip, src_ip, out_port, in_port)
+            self.send_flow_mod(parser, dpid, pkt_type, src_ip, dst_ip, in_port, out_port, 2, 30)
+            self.send_flow_mod(parser, dpid, pkt_type, dst_ip, src_ip, out_port, in_port, 2, 30)
+
+        self.last_handle_ipv4[(src_ip, dst_ip)] = now
+        self.get_bottom_link_lock.release()
 
         # send packet_out
         _, dpid, out_port = port_path[-1]
@@ -295,6 +318,43 @@ class Workload(app_manager.RyuApp):
         out = parser.OFPPacketOut(
             datapath=dp, buffer_id=msg.buffer_id, in_port=in_port, actions=actions, data=msg.data)
         dp.send_msg(out)
+
+    def available_path(self, src, dst):
+        try:
+            paths = list(nx.shortest_simple_paths(self.topo_map, src, dst, weight='hop'))
+            return paths
+        except:
+            self.logger.info('host not find/no path')
+
+    def bottom_link(self, path):
+        # traverse port path:  s1, out_port ->  s2, in_port
+        # for all ports among switches, use max(in_port_workload, out_port_workload) to calc link workload
+        # link available bw =  self.LINK_MAX_BANDWIDTH - link workload
+        # return minimum link available bw
+        minimum_bw_link = {"dpid1": None, "out_port": None, "dpid2": None, "in_port": None, "bw": self.LINK_MAX_BANDWIDTH}
+        for i in range(1, len(path) - 2):
+            out_port = self.link_info[(path[i], path[i + 1])]
+            in_port = self.link_info[(path[i + 1], path[i])]
+            try:
+                link_workload = max(self.workload[path[i]][out_port], self.workload[path[i + 1]][in_port])
+                link_avail_bw = self.LINK_MAX_BANDWIDTH - link_workload
+                if link_avail_bw < minimum_bw_link["bw"]:
+                    # self.logger.info('link %s:%s -> %s:%s bw %s' % (path[i], out_port, path[i + 1], in_port, link_avail_bw))
+                    minimum_bw_link = {"dpid1": path[i], "out_port": out_port, "dpid2": path[i + 1], "in_port": in_port, "bw": link_avail_bw}
+            except:
+                self.logger.info('calc link %s:%s -> %s:%s workload failed' % (path[i], out_port, path[i + 1], in_port))
+                self.links_info_tmp[str(path)] = {"dpid1": None, "out_port": None, "dpid2": None, "in_port": None, "bw": 0.0}
+                return self.links_info_tmp[str(path)]
+        self.links_info_tmp[str(path)] = minimum_bw_link
+        return minimum_bw_link
+    
+    def path_cmp(self, x, y):
+        link_x = self.bottom_link(x)
+        link_y = self.bottom_link(y)
+        if link_x["bw"] >= link_y["bw"]:
+            return -1
+        else:
+            return 1
 
     def shortest_path(self, src, dst, weight='hop'):
         try:
@@ -316,4 +376,19 @@ class Workload(app_manager.RyuApp):
         for node in port_path:
             path += '{}:s{}:{}'.format(*node) + ' -> '
         path += dst
+        self.logger.info(path)
+    
+    def show_path_with_bottom_link(self, src, dst, path, link_info):
+        port_path = []
+        for i in range(1, len(path) - 1):
+            in_port = self.link_info[(path[i], path[i - 1])]
+            out_port = self.link_info[(path[i], path[i + 1])]
+            port_path.append((in_port, path[i], out_port))
+        self.logger.info('path: {} -> {}'.format(src, dst))
+        path = src + ' -> '
+        for node in port_path:
+            path += '{}:s{}:{}'.format(*node) + ' -> '
+        path += dst
+        if link_info:
+            path += " bottom_link: %s:%s -> %s:%s bw: %s" % (link_info["dpid1"], link_info["out_port"], link_info["dpid2"], link_info["in_port"], link_info["bw"])
         self.logger.info(path)
